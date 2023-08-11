@@ -1,4 +1,5 @@
 import eyed3
+import httpx
 import logging as log
 import os
 import paramiko
