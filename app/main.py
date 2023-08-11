@@ -1,6 +1,7 @@
 import eyed3
 import logging as log
 import os
+import httpx
 import paramiko
 import pathlib
 import setlist_fm_client
@@ -48,7 +49,9 @@ PLEX_UPDATE_SCRIPT_CATEGORY = os.getenv("PLEX_UPDATE_SCRIPT_CATEGORY", "lidarr")
 SETLIST_API_KEY = os.getenv("SETLIST_FM_API_KEY")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/sshconfig/id_rsa.oci")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/Plex/downloads/ytdl")
-REMOTE_DOWNLOAD_DIR = os.getenv("REMOTE_DOWNLOAD_DIR", "/Users/admin/Plex/downloads/ytdl")
+REMOTE_DOWNLOAD_DIR = os.getenv(
+    "REMOTE_DOWNLOAD_DIR", "/Users/admin/Plex/downloads/ytdl"
+)
 
 bot = telebot.TeleBot(
     os.getenv("TELEGRAM_BOT_TOKEN"),
