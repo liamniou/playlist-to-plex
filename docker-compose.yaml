@@ -1,0 +1,22 @@
+---
+version: "3.4"
+services:
+  playlist-to-plex:
+    image: liamnou/playlist_to_plex:latest
+    # build:
+    #   dockerfile: ./Dockerfile
+    container_name: playlist-to-plex
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - PLEX_HOST=${PLEX_HOST}
+      - PLEX_HOST_USERNAME=${PLEX_HOST_USERNAME}
+      - PLEX_TOKEN=${PLEX_TOKEN}
+      - SETLIST_FM_API_KEY=${SETLIST_FM_API_KEY}
+      - PLEX_UPDATE_SCRIPT_PATH=${PLEX_UPDATE_SCRIPT_PATH}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    volumes:
+      - /Users/stanislau.liamniou/.ssh:/sshconfig
+      - /Volumes/Plex:/Plex
