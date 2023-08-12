@@ -13,6 +13,7 @@ import telebot
 
 
 from dataclasses import dataclass, field
+from pathvalidate import sanitize_filename
 from plexapi.myplex import PlexServer
 from telebot import types
 from typing import List
@@ -194,6 +195,7 @@ def download_from_yt(song_name, yt_search_string):
         os.mkdir(DOWNLOAD_DIR)
     except FileExistsError:
         pass
+    song_name = sanitize_filename(song_name)
     log.info(f"STARTING: download {song_name} from YouTube")
 
     ytdl_opts = {
@@ -212,16 +214,11 @@ def download_from_yt(song_name, yt_search_string):
         log.info(f"SUCCESS: {file} was downloaded")
 
         ext = os.path.splitext(file)[1]
-        target_file = f"{file}".replace(ext, ".mp3")
+        target_file = os.path.join(DOWNLOAD_DIR, f"{file}".replace(ext, ".mp3"))
 
         log.info(f"STARTING: convert {file} to {target_file}")
         try:
-            (
-                ffmpeg.input(f"/app/{file}")
-                .output(f"{DOWNLOAD_DIR}/{target_file}")
-                .overwrite_output()
-                .run()
-            )
+            (ffmpeg.input(f"/app/{file}").output(target_file).overwrite_output().run())
             os.remove(file)
             log.info(f"SUCCESS: convert {file} to {target_file}")
             return target_file
@@ -246,9 +243,7 @@ def download_missing_songs_from_yt(setlist, missing_songs, chat_id):
             if downloaded_file:
                 downloaded_songs.append(downloaded_file)
                 log.info(f"Setting metadata of {downloaded_file}")
-                set_song_id3_tags(
-                    song, setlist.artist_name, f"{DOWNLOAD_DIR}/{downloaded_file}"
-                )
+                set_song_id3_tags(song, setlist.artist_name, downloaded_file)
             else:
                 bot.send_message(chat_id, f"Failed to download missing song: {song}")
 
@@ -381,7 +376,7 @@ def process_category_and_download(message, conversation):
             set_song_id3_tags(
                 conversation.song,
                 conversation.artist_name,
-                f"{DOWNLOAD_DIR}/{downloaded_file}",
+                downloaded_file,
             )
             bot.send_message(
                 conversation.chat_id,
