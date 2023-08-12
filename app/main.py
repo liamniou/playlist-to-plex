@@ -1,4 +1,5 @@
 import eyed3
+import ffmpeg
 import httpx
 import logging as log
 import httpx
@@ -8,7 +9,6 @@ import pathlib
 import setlist_fm_client
 import signal
 import sys
-import subprocess
 import telebot
 
 
@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from plexapi.myplex import PlexServer
 from telebot import types
 from typing import List
+from yt_dlp import YoutubeDL
 
 
 @dataclass
@@ -41,8 +42,8 @@ class Setlist:
 class YouTubeConversation:
     chat_id: str
     video_link: str
-    artist_name: str = field(init=False)
-    song: str = field(init=False)
+    artist_name: str
+    song: str
 
 
 AUTHORIZED_USERS = [
@@ -52,13 +53,13 @@ PLEX_HOST = os.getenv("PLEX_HOST")
 PLEX_HOST_USERNAME = os.getenv("PLEX_HOST_USERNAME")
 PLEX_TOKEN = os.getenv("PLEX_TOKEN")
 PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME", "Music")
-PLEX_UPDATE_SCRIPT_PATH = os.getenv(
-    "PLEX_UPDATE_SCRIPT_PATH", False
-)
+PLEX_UPDATE_SCRIPT_PATH = os.getenv("PLEX_UPDATE_SCRIPT_PATH", False)
 SETLIST_API_KEY = os.getenv("SETLIST_FM_API_KEY")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/sshconfig/id_rsa.oci")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/Plex/downloads/ytdl")
-REMOTE_DOWNLOAD_DIR = os.getenv("REMOTE_DOWNLOAD_DIR", "/Users/admin/Plex/downloads/ytdl")
+REMOTE_DOWNLOAD_DIR = os.getenv(
+    "REMOTE_DOWNLOAD_DIR", "/Users/admin/Plex/downloads/ytdl"
+)
 
 bot = telebot.TeleBot(
     os.getenv("TELEGRAM_BOT_TOKEN"),
@@ -183,55 +184,71 @@ def set_song_id3_tags(song, artist_name, file):
     audiofile.tag.save()
 
 
-def download_from_yt(song_name, yt_search_string):
-    yt_command = f"yt-dlp {yt_search_string} -f bestaudio --max-downloads 1 -o '{song_name}.%(ext)s'"
+def get_video_object_from_yt_search(ytdl_opts, yt_search_string):
+    with YoutubeDL(ytdl_opts) as ydl:
+        return ydl.extract_info(yt_search_string, download=False)
 
+
+def download_from_yt(song_name, yt_search_string):
+    try:
+        os.mkdir(DOWNLOAD_DIR)
+    except FileExistsError:
+        pass
     log.info(f"STARTING: download {song_name} from YouTube")
-    process = subprocess.Popen(
-        yt_command,
-        shell=True,
-    )
-    process.wait()
+
+    ytdl_opts = {
+        "outtmpl": f"{song_name}.%(ext)s",
+        "format": "bestaudio",
+        "noplaylist": True,
+    }
+    video = get_video_object_from_yt_search(ytdl_opts, yt_search_string)
+
+    with YoutubeDL(ytdl_opts) as ydl:
+        result = ydl.download(video.get("webpage_url", None))
 
     file = sorted(pathlib.Path(".").glob(f"{song_name}.*"))[0]
 
-    if os.path.isfile(file):
-        log.info(f"SUCCESS: {file} was downloaded")        
+    if result == 0 and os.path.isfile(file):
+        log.info(f"SUCCESS: {file} was downloaded")
 
         ext = os.path.splitext(file)[1]
         target_file = f"{file}".replace(ext, ".mp3")
 
         log.info(f"STARTING: convert {file} to {target_file}")
-        process = subprocess.Popen(
-            f"ffmpeg -i '/app/{file}' '{DOWNLOAD_DIR}/{target_file}' -y",
-            shell=True,
-        )
-        process.wait()
-        log.info(process.returncode)
-        os.remove(file)
-        if process.returncode == 0:
-            log.info(f"SUCCESS: convert {file} to {target_file}{target_file}")
+        try:
+            (
+                ffmpeg.input(f"/app/{file}")
+                .output(f"{DOWNLOAD_DIR}/{target_file}")
+                .overwrite_output()
+                .run()
+            )
+            os.remove(file)
+            log.info(f"SUCCESS: convert {file} to {target_file}")
             return target_file
+        except ffmpeg.Error as e:
+            print(e.stderr, file=sys.stderr)
+
     else:
-        log.warning(f"FAILURE: can't find downloaded file of{song_name}")
+        log.warning(f"FAILURE: can't find downloaded file of {song_name}")
 
     return None
 
 
 def download_missing_songs_from_yt(setlist, missing_songs, chat_id):
     downloaded_songs = []
-    try:
-        os.mkdir(DOWNLOAD_DIR)
-    except FileExistsError:
-        pass
+
     for song in missing_songs:
         try:
-            downloaded_file = download_from_yt(song, f"ytsearch:'{setlist.artist_name} - {song}'")
+            downloaded_file = download_from_yt(
+                song, f"ytsearch:'{setlist.artist_name} - {song}'"
+            )
 
             if downloaded_file:
                 downloaded_songs.append(downloaded_file)
                 log.info(f"Setting metadata of {downloaded_file}")
-                set_song_id3_tags(song, setlist.artist_name, f"{DOWNLOAD_DIR}/{downloaded_file}")
+                set_song_id3_tags(
+                    song, setlist.artist_name, f"{DOWNLOAD_DIR}/{downloaded_file}"
+                )
             else:
                 bot.send_message(chat_id, f"Failed to download missing song: {song}")
 
@@ -249,9 +266,7 @@ def update_plex(category):
         ssh.connect(
             PLEX_HOST, username=PLEX_HOST_USERNAME, key_filename=SSH_KEY_PATH, port=2830
         )
-        ssh.exec_command(
-            f"{PLEX_UPDATE_SCRIPT_PATH} {REMOTE_DOWNLOAD_DIR} {category}"
-        )
+        ssh.exec_command(f"{PLEX_UPDATE_SCRIPT_PATH} {REMOTE_DOWNLOAD_DIR} {category}")
     else:
         log.warning("Can't update Plex because PLEX_UPDATE_SCRIPT_PATH is not set")
 
@@ -283,28 +298,55 @@ def create_from_setlistfm(message):
 
 
 @bot.message_handler(
-    func=lambda m: m.text is not None
-    and m.text.startswith(("https://www.youtube.com"))
+    func=lambda m: m.text is not None and m.text.startswith(("https://www.youtube.com"))
 )
 def download_youtube_video(message):
     if message.chat.id not in AUTHORIZED_USERS:
         bot.reply_to(message, "Sorry, this is a private bot")
         return
 
+    video = get_video_object_from_yt_search(
+        {"format": "bestaudio", "noplaylist": True}, message.text
+    )
+    artist_name = video.get("channel", "N/A")
+    song = (
+        video.get("title", "N/A")
+        .replace(artist_name, "")
+        .replace("Official Video", "")
+        .replace("[]", "")
+        .replace("()", "")
+        .replace("-", "")
+        .strip()
+    )
+
     conversation = YouTubeConversation(
         chat_id=message.chat.id,
         video_link=message.text,
+        artist_name=artist_name,
+        song=song,
     )
+
     msg = bot.reply_to(
         message,
-        f"Enter artist name",
+        f"Enter artist name manually or press the button with the suggested one",
+        reply_markup=types.ReplyKeyboardMarkup().add(
+            types.KeyboardButton(conversation.artist_name)
+        ),
     )
-    bot.register_next_step_handler(msg, lambda m: process_artist_name_step(m, conversation))
+    bot.register_next_step_handler(
+        msg, lambda m: process_artist_name_step(m, conversation)
+    )
 
 
 def process_artist_name_step(message, conversation):
     conversation.artist_name = message.text
-    msg = bot.reply_to(message, 'Enter song name')
+    msg = bot.reply_to(
+        message,
+        "Enter song name manually or press the button with the suggested one",
+        reply_markup=types.ReplyKeyboardMarkup().add(
+            types.KeyboardButton(conversation.song)
+        ),
+    )
     bot.register_next_step_handler(msg, lambda m: process_song_name(m, conversation))
 
 
@@ -312,13 +354,18 @@ def process_song_name(message, conversation):
     conversation.song = message.text
 
     markup = types.ReplyKeyboardMarkup()
-    button_1 = types.KeyboardButton("Music")
-    button_2 = types.KeyboardButton("Podcast")
-    button_3 = types.KeyboardButton("Audiobook")
-    markup.add(button_1, button_2, button_3)
+    markup.add(
+        types.KeyboardButton("Music"),
+        types.KeyboardButton("Podcast"),
+        types.KeyboardButton("Audiobook"),
+    )
 
-    msg = bot.reply_to(message, 'Do I sort it as music or podcast?', reply_markup=markup)
-    bot.register_next_step_handler(msg, lambda m: process_category_and_download(m, conversation))
+    msg = bot.reply_to(
+        message, "Do I sort it as music/podcast/audiobook?", reply_markup=markup
+    )
+    bot.register_next_step_handler(
+        msg, lambda m: process_category_and_download(m, conversation)
+    )
 
 
 def process_category_and_download(message, conversation):
@@ -331,15 +378,27 @@ def process_category_and_download(message, conversation):
 
         if downloaded_file:
             log.info(f"Setting metadata of {downloaded_file}")
-            set_song_id3_tags(conversation.song, conversation.artist_name, f"{DOWNLOAD_DIR}/{downloaded_file}")
-            bot.send_message(conversation.chat_id, f"{conversation.artist_name} - {conversation.song} was downloaded")
+            set_song_id3_tags(
+                conversation.song,
+                conversation.artist_name,
+                f"{DOWNLOAD_DIR}/{downloaded_file}",
+            )
+            bot.send_message(
+                conversation.chat_id,
+                f"{conversation.artist_name} - {conversation.song} was downloaded",
+            )
             update_plex(category)
         else:
-            bot.send_message(conversation.chat_id, "Something went wrong during the download")
+            bot.send_message(
+                conversation.chat_id, "Something went wrong during the download"
+            )
 
     except Exception as e:
         log.error(f"Error while processing {conversation.song}: {e}")
-        bot.send_message(conversation.chat_id, f"Failed to download missing song: {conversation.song}")
+        bot.send_message(
+            conversation.chat_id,
+            f"Failed to download missing song: {conversation.song}",
+        )
 
 
 def main():
