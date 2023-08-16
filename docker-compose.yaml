@@ -17,6 +17,8 @@ services:
       - SETLIST_FM_API_KEY=${SETLIST_FM_API_KEY}
       - PLEX_UPDATE_SCRIPT_PATH=${PLEX_UPDATE_SCRIPT_PATH}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
     volumes:
       - /Users/stanislau.liamniou/.ssh:/sshconfig
       - /Volumes/Plex:/Plex

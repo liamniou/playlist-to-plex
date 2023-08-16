@@ -8,13 +8,17 @@ import paramiko
 import pathlib
 import setlist_fm_client
 import signal
+import shutil
+import spotipy
 import sys
 import telebot
 
 
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathvalidate import sanitize_filename
 from plexapi.myplex import PlexServer
+from spotipy.oauth2 import SpotifyClientCredentials
 from telebot import types
 from typing import List
 from yt_dlp import YoutubeDL
@@ -40,6 +44,31 @@ class Setlist:
 
 
 @dataclass
+class SpotifyPlaylist:
+    playlist_name: str
+    songs: dict
+    playlist_by_artist: dict = field(default_factory=lambda: {})
+    songs_on_plex_by_artist: dict = field(default_factory=lambda: {})
+
+    def __post_init__(self):
+        for song in self.songs:
+            if not self.songs_on_plex_by_artist.get(
+                song["track"]["artists"][0]["name"]
+            ):
+                self.songs_on_plex_by_artist[song["track"]["artists"][0]["name"]] = []
+
+        for song in self.songs:
+            if self.playlist_by_artist.get(song["track"]["artists"][0]["name"]):
+                self.playlist_by_artist[song["track"]["artists"][0]["name"]].append(
+                    song["track"]["name"]
+                )
+            else:
+                self.playlist_by_artist[song["track"]["artists"][0]["name"]] = [
+                    song["track"]["name"]
+                ]
+
+
+@dataclass
 class YouTubeConversation:
     chat_id: str
     video_link: str
@@ -61,6 +90,9 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/Plex/downloads/ytdl")
 REMOTE_DOWNLOAD_DIR = os.getenv(
     "REMOTE_DOWNLOAD_DIR", "/Users/admin/Plex/downloads/ytdl"
 )
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
+
 
 bot = telebot.TeleBot(
     os.getenv("TELEGRAM_BOT_TOKEN"),
@@ -109,8 +141,6 @@ def parse_setlistfm_url(setlistfm_url):
         api_key=SETLIST_API_KEY,
     )
 
-    print(response.json())
-
     return Setlist(
         id=response.json()["id"],
         artist_name=response.json()["artist"]["name"],
@@ -120,39 +150,87 @@ def parse_setlistfm_url(setlistfm_url):
     )
 
 
-def create_plex_playlist_from_setlist(setlist):
-    plex_search = plex_music.searchArtists(title=setlist.artist_name)
+def how_similar(string_a, string_b):
+    return SequenceMatcher(None, string_a, string_b).ratio()
 
-    plex_songs = []
-    for artist in plex_search:
-        for album in artist.albums():
-            for song in album.tracks():
-                plex_songs.append(song)
 
+def calculate_match_rating(string_a, string_b):
+    string_a = string_a.replace("Remastered", "").replace("Remaster", "")
+    string_b = string_b.replace("Remastered", "").replace("Remaster", "")
+    match_rating = round(
+        how_similar(
+            "".join(filter(str.isalpha, string_a)),
+            "".join(filter(str.isalpha, string_b)),
+        )
+        * 100,
+        1,
+    )
+    return match_rating
+
+
+def search_plex_by_artist(wanted_songs, artist_name):
+    wanted_songs_on_plex = []
     sorted_plex_songs = []
-    for song in setlist.songs:
-        log.info(f"Searching for song '{setlist.artist_name} - {song}' in Plex library")
-        for plex_song in plex_songs:
-            print(
-                f"Comparing {song} with {plex_song.title}: ",
-                song.lower().replace("'", "’") == plex_song.title.lower(),
-            )
-            if song.lower().replace("'", "’") == plex_song.title.lower():
-                sorted_plex_songs.append(plex_song)
-                setlist.songs_on_plex.append(song)
-                break
+
+    plex_artist = plex_music.searchArtists()
+
+    for artist in plex_artist:
+        # Plex is inconsistent with some chars:
+        # Sometimes it's Guns N' Roses, sometimes Guns N’ Roses...
+        # That's why there is calculate_match_rating()
+        if calculate_match_rating(artist.title, artist_name) > 80:
+            log.info(f"Found matching artist: {artist.title}")
+            for song in wanted_songs:
+                for track in artist.tracks():
+                    log.warning(f"Comparing {song} with {track.title}")
+                    if calculate_match_rating(track.title, song) > 80:
+                        sorted_plex_songs.append(track)
+                        wanted_songs_on_plex.append(song)
+                        break
+
+    return sorted_plex_songs, wanted_songs_on_plex
+
+
+def create_plex_playlist(songs, playlist_name):
+    for playlist in plex.playlists():
+        if playlist.title == playlist_name:
+            log.warning(f"Playlist {playlist_name} already exists. Deleting...")
+            playlist.delete()
+            break
+    plex.createPlaylist(
+        title=playlist_name,
+        items=songs,
+    )
+    return True
+
+
+def create_plex_playlist_from_setlist(setlist):
+    sorted_plex_songs, wanted_songs_on_plex = search_plex_by_artist(
+        setlist.songs, setlist.artist_name
+    )
+    setlist.songs_on_plex = wanted_songs_on_plex
 
     if sorted_plex_songs:
-        for playlist in plex.playlists():
-            if playlist.title == setlist.plex_playlist_name:
-                log.warning(
-                    f"Playlist {setlist.plex_playlist_name} already exists. Deleting..."
-                )
-                playlist.delete()
-                break
-        plex.createPlaylist(
-            title=f"{setlist.artist_name} - {setlist.event_date} - {setlist.country}",
-            items=sorted_plex_songs,
+        create_plex_playlist(
+            sorted_plex_songs,
+            f"{setlist.artist_name} - {setlist.event_date} - {setlist.country}",
+        )
+        return True
+
+    return False
+
+
+def create_plex_playlist_from_spotify_playlist(playlist):
+    all_artists_sorted_plex_songs = []
+    for artist, songs in playlist.playlist_by_artist.items():
+        sorted_plex_songs, wanted_songs_on_plex = search_plex_by_artist(songs, artist)
+        playlist.songs_on_plex_by_artist[artist].extend(wanted_songs_on_plex)
+        all_artists_sorted_plex_songs.extend(sorted_plex_songs)
+
+    if all_artists_sorted_plex_songs:
+        create_plex_playlist(
+            all_artists_sorted_plex_songs,
+            f"{playlist.playlist_name}",
         )
         return True
 
@@ -231,19 +309,19 @@ def download_from_yt(song_name, yt_search_string):
     return None
 
 
-def download_missing_songs_from_yt(setlist, missing_songs, chat_id):
+def download_missing_songs_from_yt(artist_name, missing_songs, chat_id):
     downloaded_songs = []
 
     for song in missing_songs:
         try:
             downloaded_file = download_from_yt(
-                song, f"ytsearch:'{setlist.artist_name} - {song}'"
+                song, f"ytsearch:'{artist_name} - {song}'"
             )
 
             if downloaded_file:
                 downloaded_songs.append(downloaded_file)
                 log.info(f"Setting metadata of {downloaded_file}")
-                set_song_id3_tags(song, setlist.artist_name, downloaded_file)
+                set_song_id3_tags(song, artist_name, downloaded_file)
             else:
                 bot.send_message(chat_id, f"Failed to download missing song: {song}")
 
@@ -279,9 +357,11 @@ def create_from_setlistfm(message):
         response = "Playlist created!"
     missing_songs = list(set(setlist.songs) - set(setlist.songs_on_plex))
     if missing_songs:
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
         bot.send_message(message.chat.id, f"Missing songs: {missing_songs}")
         downloaded_songs = download_missing_songs_from_yt(
-            setlist, missing_songs, message.chat.id
+            setlist.artist_name, missing_songs, message.chat.id
         )
         if downloaded_songs:
             update_plex("Music")
@@ -395,6 +475,70 @@ def process_category_and_download(message, conversation):
             conversation.chat_id,
             f"Failed to download missing song: {conversation.song}",
         )
+
+
+def parse_spotify_url(url):
+    playlist_id = url.split("/")[-1].split("?")[0]
+    sp = spotipy.Spotify(
+        auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET
+        )
+    )
+    playlist = sp.playlist(f"spotify:playlist:{playlist_id}")
+    return SpotifyPlaylist(
+        playlist_name=playlist["name"], songs=playlist["tracks"]["items"]
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text is not None
+    and m.text.startswith(("https://open.spotify.com/playlist"))
+)
+@log_and_send_message_decorator
+def create_from_spotify(message):
+    response = ""
+    spotify_playlist = parse_spotify_url(message.text)
+    playlist = create_plex_playlist_from_spotify_playlist(spotify_playlist)
+
+    if playlist:
+        response = "Playlist created!"
+
+    missing_songs = {}
+
+    for artist, songs in spotify_playlist.playlist_by_artist.items():
+        artist_missings_songs = list(
+            set(songs) - set(spotify_playlist.songs_on_plex_by_artist[artist])
+        )
+        missing_songs[artist] = artist_missings_songs
+
+    log.warning(missing_songs)
+    missing_songs_string = ""
+    for artist, songs in missing_songs.items():
+        for song in songs:
+            missing_songs_string += f"{artist} - {song}, "
+
+    bot.send_message(message.chat.id, f"Missing songs: {missing_songs_string}")
+
+    downloaded_songs = []
+
+    if missing_songs:
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
+        for artist, artist_missing_songs in missing_songs.items():
+            log.warning(f"Downloading {artist} {artist_missing_songs}")
+            downloaded_songs.extend(
+                download_missing_songs_from_yt(
+                    artist, artist_missing_songs, message.chat.id
+                )
+            )
+
+    if downloaded_songs:
+        update_plex("Music")
+        response += (
+            "\nThere were missing songs, re-send the link to get full playlist"
+        )
+
+    return response
 
 
 def main():
