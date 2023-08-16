@@ -47,3 +47,4 @@ urllib3==2.0.4
 websockets==11.0.3
 yarl==1.9.2
 yt-dlp==2023.7.6
+ytmusicapi==1.1.1
