@@ -22,6 +22,15 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from telebot import types
 from typing import List
 from yt_dlp import YoutubeDL
+from ytmusicapi import YTMusic
+
+
+@dataclass
+class YtMusic:
+    id: str
+    title: str
+    album: str
+    artist: str
 
 
 @dataclass
@@ -253,12 +262,12 @@ def get_album_by_song_name(song_name, artist_name):
         return None
 
 
-def set_song_id3_tags(song, artist_name, file):
+def set_song_id3_tags(song, artist_name, file, album=None):
     audiofile = eyed3.load(file)
     audiofile.initTag()
     audiofile.tag.artist = artist_name
     audiofile.tag.album_artist = artist_name
-    audiofile.tag.album = get_album_by_song_name(song, artist_name)
+    audiofile.tag.album = album if album else get_album_by_song_name(song, artist_name)
     audiofile.tag.title = song
     audiofile.tag.save()
 
@@ -274,17 +283,15 @@ def download_from_yt(song_name, yt_search_string):
     except FileExistsError:
         pass
     song_name = sanitize_filename(song_name)
-    log.info(f"STARTING: download {song_name} from YouTube")
+    log.info(f"STARTING: download {song_name} ({yt_search_string}) from YouTube")
 
     ytdl_opts = {
         "outtmpl": f"{song_name}.%(ext)s",
         "format": "bestaudio",
-        "noplaylist": True,
     }
-    video = get_video_object_from_yt_search(ytdl_opts, yt_search_string)
 
     with YoutubeDL(ytdl_opts) as ydl:
-        result = ydl.download(video.get("webpage_url", None))
+        result = ydl.download(yt_search_string)
 
     file = sorted(pathlib.Path(".").glob(f"{song_name}.*"))[0]
 
@@ -314,14 +321,24 @@ def download_missing_songs_from_yt(artist_name, missing_songs, chat_id):
 
     for song in missing_songs:
         try:
+            ytmusic = YTMusic()
+            res = ytmusic.search(f"{artist_name} - {song}", filter="songs")
+            for item in res[:1]:
+                yt_song = YtMusic(
+                    item["videoId"],
+                    item["title"],
+                    item["album"]["name"],
+                    item["artists"][0]["name"],
+                )
+
             downloaded_file = download_from_yt(
-                song, f"ytsearch:'{artist_name} - {song}'"
+                yt_song.title, yt_song.id
             )
 
             if downloaded_file:
                 downloaded_songs.append(downloaded_file)
                 log.info(f"Setting metadata of {downloaded_file}")
-                set_song_id3_tags(song, artist_name, downloaded_file)
+                set_song_id3_tags(yt_song.title, yt_song.artist, downloaded_file, yt_song.album)
             else:
                 bot.send_message(chat_id, f"Failed to download missing song: {song}")
 
@@ -342,6 +359,7 @@ def update_plex(category):
         ssh.exec_command(f"{PLEX_UPDATE_SCRIPT_PATH} {REMOTE_DOWNLOAD_DIR} {category}")
     else:
         log.warning("Can't update Plex because PLEX_UPDATE_SCRIPT_PATH is not set")
+    plex_music.update()
 
 
 @bot.message_handler(
@@ -365,8 +383,9 @@ def create_from_setlistfm(message):
         )
         if downloaded_songs:
             update_plex("Music")
+            create_plex_playlist_from_setlist(setlist)
             response += (
-                "\nThere were missing songs, re-send the link to get full playlist"
+                "\nThe playlist was updated with new songs."
             )
 
     return response
@@ -534,9 +553,8 @@ def create_from_spotify(message):
 
     if downloaded_songs:
         update_plex("Music")
-        response += (
-            "\nThere were missing songs, re-send the link to get full playlist"
-        )
+        create_plex_playlist_from_spotify_playlist(spotify_playlist)
+        response += "\nThe playlist was updated with new songs."
 
     return response
 
