@@ -26,6 +26,14 @@ from ytmusicapi import YTMusic
 
 
 @dataclass
+class DownloadedSong:
+    artist: str
+    title: str
+    album: str
+    file: str
+
+
+@dataclass
 class YtMusic:
     id: str
     title: str
@@ -213,6 +221,14 @@ def create_plex_playlist(songs, playlist_name):
     return True
 
 
+def add_new_songs_to_plex_playlist(songs, playlist_name):
+    for playlist in plex.playlists():
+        if playlist.title == playlist_name:
+            playlist.addItems(songs)
+            return True
+    return False
+
+
 def create_plex_playlist_from_setlist(setlist):
     sorted_plex_songs, wanted_songs_on_plex = search_plex_by_artist(
         setlist.songs, setlist.artist_name
@@ -222,7 +238,7 @@ def create_plex_playlist_from_setlist(setlist):
     if sorted_plex_songs:
         create_plex_playlist(
             sorted_plex_songs,
-            f"{setlist.artist_name} - {setlist.event_date} - {setlist.country}",
+            setlist.plex_playlist_name,
         )
         return True
 
@@ -239,7 +255,7 @@ def create_plex_playlist_from_spotify_playlist(playlist):
     if all_artists_sorted_plex_songs:
         create_plex_playlist(
             all_artists_sorted_plex_songs,
-            f"{playlist.playlist_name}",
+            playlist.playlist_name,
         )
         return True
 
@@ -277,9 +293,9 @@ def get_video_object_from_yt_search(ytdl_opts, yt_search_string):
         return ydl.extract_info(yt_search_string, download=False)
 
 
-def download_from_yt(song_name, yt_search_string):
+def download_from_yt(song_name, yt_search_string, target_dir=DOWNLOAD_DIR):
     try:
-        os.mkdir(DOWNLOAD_DIR)
+        os.makedirs(target_dir)
     except FileExistsError:
         pass
     song_name = sanitize_filename(song_name)
@@ -299,7 +315,7 @@ def download_from_yt(song_name, yt_search_string):
         log.info(f"SUCCESS: {file} was downloaded")
 
         ext = os.path.splitext(file)[1]
-        target_file = os.path.join(DOWNLOAD_DIR, f"{file}".replace(ext, ".mp3"))
+        target_file = os.path.join(target_dir, f"{file}".replace(ext, ".mp3"))
 
         log.info(f"STARTING: convert {file} to {target_file}")
         try:
@@ -331,16 +347,32 @@ def download_missing_songs_from_yt(artist_name, missing_songs, chat_id):
                     item["artists"][0]["name"],
                 )
 
+            if yt_song.title != song:
+                bot.send_message(
+                    chat_id,
+                    f'Cant find "{artist_name} - {song}". Downloading "{yt_song.artist} - {yt_song.title}" instead',
+                )
+
             downloaded_file = download_from_yt(
-                yt_song.title, yt_song.id
+                yt_song.title,
+                yt_song.id,
+                os.path.join("/Plex/Music", yt_song.artist, yt_song.album),
             )
 
             if downloaded_file:
-                downloaded_songs.append(downloaded_file)
-                log.info(f"Setting metadata of {downloaded_file}")
-                set_song_id3_tags(yt_song.title, yt_song.artist, downloaded_file, yt_song.album)
+                downloaded_song = DownloadedSong(
+                    yt_song.artist, yt_song.title, yt_song.album, downloaded_file
+                )
+                downloaded_songs.append(downloaded_song)
+                log.info(f"Setting metadata of {downloaded_song.title}")
+                set_song_id3_tags(
+                    downloaded_song.title,
+                    downloaded_song.artist,
+                    downloaded_song.file,
+                    downloaded_song.album,
+                )
             else:
-                bot.send_message(chat_id, f"Failed to download missing song: {song}")
+                bot.send_message(chat_id, f"Failed to find downloaded file of {song}")
 
         except Exception as e:
             log.error(f"Error while processing {song}: {e}")
@@ -349,8 +381,8 @@ def download_missing_songs_from_yt(artist_name, missing_songs, chat_id):
     return downloaded_songs
 
 
-def update_plex(category):
-    if PLEX_UPDATE_SCRIPT_PATH:
+def update_plex(category, run_script=True):
+    if run_script and PLEX_UPDATE_SCRIPT_PATH:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(
@@ -358,7 +390,7 @@ def update_plex(category):
         )
         ssh.exec_command(f"{PLEX_UPDATE_SCRIPT_PATH} {REMOTE_DOWNLOAD_DIR} {category}")
     else:
-        log.warning("Can't update Plex because PLEX_UPDATE_SCRIPT_PATH is not set")
+        log.warning("Skipping plex update script execution")
     plex_music.update()
 
 
@@ -374,19 +406,27 @@ def create_from_setlistfm(message):
     if playlist:
         response = "Playlist created!"
     missing_songs = list(set(setlist.songs) - set(setlist.songs_on_plex))
+    downloaded_songs = []
     if missing_songs:
-        if os.path.exists(DOWNLOAD_DIR):
-            shutil.rmtree(DOWNLOAD_DIR)
         bot.send_message(message.chat.id, f"Missing songs: {missing_songs}")
         downloaded_songs = download_missing_songs_from_yt(
             setlist.artist_name, missing_songs, message.chat.id
         )
-        if downloaded_songs:
-            update_plex("Music")
-            create_plex_playlist_from_setlist(setlist)
-            response += (
-                "\nThe playlist was updated with new songs."
+
+    if downloaded_songs:
+        update_plex("Music", False)
+        downloaded_songs_string = ""
+        for downloaded_song in downloaded_songs:
+            downloaded_songs_string += (
+                f"{downloaded_song.artist} - {downloaded_song.title}, "
             )
+            sorted_plex_songs, _ = search_plex_by_artist(
+                [downloaded_song.title], downloaded_song.artist
+            )
+            add_new_songs_to_plex_playlist(
+                sorted_plex_songs, setlist.plex_playlist_name
+            )
+        response += f"\nThere were missing songs on Plex. I tried to download them and add to the playlist. Here is the list: {downloaded_songs_string}"
 
     return response
 
@@ -468,6 +508,8 @@ def process_category_and_download(message, conversation):
     category = message.text
 
     try:
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
         bot.reply_to(message, f"Starting the download...", reply_markup=markup)
         downloaded_file = download_from_yt(conversation.song, conversation.video_link)
 
@@ -541,8 +583,6 @@ def create_from_spotify(message):
     downloaded_songs = []
 
     if missing_songs:
-        if os.path.exists(DOWNLOAD_DIR):
-            shutil.rmtree(DOWNLOAD_DIR)
         for artist, artist_missing_songs in missing_songs.items():
             log.warning(f"Downloading {artist} {artist_missing_songs}")
             downloaded_songs.extend(
@@ -552,9 +592,19 @@ def create_from_spotify(message):
             )
 
     if downloaded_songs:
-        update_plex("Music")
-        create_plex_playlist_from_spotify_playlist(spotify_playlist)
-        response += "\nThe playlist was updated with new songs."
+        update_plex("Music", False)
+        downloaded_songs_string = ""
+        for downloaded_song in downloaded_songs:
+            downloaded_songs_string += (
+                f"{downloaded_song.artist} - {downloaded_song.title}, "
+            )
+            sorted_plex_songs, _ = search_plex_by_artist(
+                [downloaded_song.title], downloaded_song.artist
+            )
+            add_new_songs_to_plex_playlist(
+                sorted_plex_songs, spotify_playlist.playlist_name
+            )
+        response += f"\nThere were missing songs on Plex. I tried to download them and add to the playlist. Here is the list: {downloaded_songs_string}"
 
     return response
 
