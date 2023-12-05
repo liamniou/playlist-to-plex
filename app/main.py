@@ -98,6 +98,7 @@ AUTHORIZED_USERS = [
 ]
 PLEX_HOST = os.getenv("PLEX_HOST")
 PLEX_HOST_USERNAME = os.getenv("PLEX_HOST_USERNAME")
+PLEX_HOST_SSH_PORT = os.getenv("PLEX_HOST_SSH_PORT")
 PLEX_TOKEN = os.getenv("PLEX_TOKEN")
 PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME", "Music")
 PLEX_UPDATE_SCRIPT_PATH = os.getenv("PLEX_UPDATE_SCRIPT_PATH", False)
@@ -118,7 +119,7 @@ bot = telebot.TeleBot(
 )
 
 
-plex = PlexServer("http://192.168.0.37:32400", PLEX_TOKEN)
+plex = PlexServer(f"http://{PLEX_HOST}:32400", PLEX_TOKEN)
 plex_music = plex.library.section(PLEX_LIBRARY_NAME)
 
 
@@ -386,7 +387,7 @@ def update_plex(category, run_script=True):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(
-            PLEX_HOST, username=PLEX_HOST_USERNAME, key_filename=SSH_KEY_PATH, port=2830
+            PLEX_HOST, username=PLEX_HOST_USERNAME, key_filename=SSH_KEY_PATH, port=PLEX_HOST_SSH_PORT
         )
         ssh.exec_command(f"{PLEX_UPDATE_SCRIPT_PATH} {REMOTE_DOWNLOAD_DIR} {category}")
     else:
