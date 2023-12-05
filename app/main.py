@@ -433,7 +433,7 @@ def create_from_setlistfm(message):
 
 @bot.message_handler(
     func=lambda m: m.text is not None
-    and m.text.startswith(tuple(["https://www.youtube.com", "https://youtu.be"]))
+    and m.text.startswith(tuple(["https://www.youtube.com", "https://youtu.be", "https://m.youtube.com", "https://youtube.com"]))
 )
 def download_youtube_video(message):
     if message.chat.id not in AUTHORIZED_USERS:
